@@ -93,7 +93,8 @@ out its own session's file:
     [ -n "$sid" ] && [ -f "$f" ] && jq -r --argjson now "$(date +%s)" '
       if .state == "active" then
         "kw \(.bumps)/\(.maxBumps) " + (if .cold then "waiting"
-          else ((.nextBumpAt - $now) as $s | if $s <= 0 then "due" else "next \((($s + 59) / 60) | floor)m" end) end)
+           elif .nextBumpAt == null then "waiting-cache"
+           else ((.nextBumpAt - $now) as $s | if $s <= 0 then "due" else "next \((($s + 59) / 60) | floor)m" end) end)
       elif .state == "paused" then "kw paused" else "kw off" end' "$f"
 
 That prints `kw 2/8 next 31m`, `kw paused` or `kw off`. The status line only
@@ -144,6 +145,35 @@ Claude Code's own prompt-cache tracking counts the fork, so a status line that
 shows `prompt_cache.expires_at` restarts its countdown at each bump. The sessions
 file also records `lastBumpAt`.
 
+### Schedule from the cache deadline
+
+Set `KEEPWARM_CACHE_MARGIN_MIN=5` to schedule a bump five minutes before the
+status line's `prompt_cache.expires_at`, instead of counting idle minutes.
+This handles resumed sessions and responses that took a long time to finish.
+The margin should be shorter than your cache TTL. Checks still run every
+60 seconds, so a due bump starts on the next check while the cache is warm.
+
+Function hooks do not expose `prompt_cache` through `$.session.usage()`, so
+the status line must save it for the plugin. From a checkout of this repository:
+
+```sh
+mkdir -p ~/.claude/keepwarm
+cp plugins/keepwarm/scripts/write-cache.sh ~/.claude/keepwarm/write-cache.sh
+```
+
+After your status line reads its JSON into `input`, add:
+
+```sh
+printf '%s' "$input" | bash "$HOME/.claude/keepwarm/write-cache.sh"
+```
+
+The bridge writes only cache fields, by session id, to
+`~/.claude/keepwarm/cache/<id>.json`. With deadline scheduling enabled, the
+plugin waits for a warm cache snapshot; it does not fall back to an idle timer.
+A restored status-line estimate remains an estimate until a fresh API response
+updates it. The sessions file publishes `schedule: "cache-expiry"`,
+`cacheMarginMinutes`, and the deadline in `nextBumpAt` (null until known).
+
 ## The two mechanisms
 
 | | `keepwarm` | `keepwarm-shell` |
@@ -153,7 +183,7 @@ file also records `lastBumpAt`.
 | Timer | `$.clock.every` | `sleep` loop |
 | Ping | `$.model.fork`, no transcript row | monitor stdout, a real turn |
 | Size gate | `$.session.usage()` context tokens | transcript bytes |
-| Safety valve | skips a bump past `KEEPWARM_TTL_MIN`; stops if a bump still creates more cache than it reads | same, read from the transcript |
+| Safety valve | skips a bump past the cache deadline (or `KEEPWARM_TTL_MIN` in idle mode); stops if a bump creates more cache than it reads | skips past the configured TTL, read from the transcript; same rebuild check |
 | Kill switch | `~/.claude/keepwarm-off` | same |
 | Pause | `/keepwarm pause` for one session | none; `KEEPWARM_DISABLE=1` or the kill switch |
 | Status line | `~/.claude/keepwarm/sessions/<id>.json` | none; `/keepwarm` reads the log |
@@ -168,7 +198,7 @@ good trade if you come back and a bad one if you do not, so keepwarm stops after
 `KEEPWARM_MAX_BUMPS` (default 8) and lets the cache go cold.
 
 In `keepwarm`, each main-thread turn resets the bump count to zero. Once the
-reply finishes, the idle clock restarts. A new main-thread turn also re-enables
+reply finishes, the idle clock restarts; deadline mode follows the updated cache expiry. A new main-thread turn also re-enables
 a keepalive stopped at the bump limit. It preserves a manual pause and does
 not restart a keepalive stopped by the kill switch, API errors or a cache
 rebuild. Subagent activity does not reset the count. `keepwarm-shell` keeps
@@ -197,6 +227,7 @@ does not inherit the launching shell's environment. See its `config.env.example`
 | | default | |
 |---|---|---|
 | `KEEPWARM_INTERVAL_MIN` | 45 | idle minutes before a bump. Keep it under your TTL, with room for a late tick |
+| `KEEPWARM_CACHE_MARGIN_MIN` | unset | `keepwarm` only: when set, bump this many minutes before the status line's cache deadline instead of using the idle interval |
 | `KEEPWARM_PING_TEXT` | built-in single-period prompt | `keepwarm` only: the text sent in the background keepalive request |
 | `KEEPWARM_TTL_MIN` | 60 | your prompt-cache TTL. A bump this late is skipped, since the cache is already cold |
 | `KEEPWARM_MAX_BUMPS` | 8 | bumps before it lets the cache go cold; `keepwarm` resets this count on each main-thread turn |

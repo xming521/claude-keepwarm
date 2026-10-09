@@ -12,6 +12,7 @@ const DEFAULTS = {
   maxBumps: 8,
   minContextTokens: 20_000,
   pollSeconds: 60,
+  cacheMarginMinutes: 0,
 }
 
 // Consecutive bumps that came back with an API error before it gives up.
@@ -45,6 +46,25 @@ const number = (raw: string | undefined, fallback: number): number => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }
 
+const schedule = async ($: any): Promise<{ next: number | null; expires: number | null }> => {
+  if (config.cacheMarginMinutes === 0) return {
+    next: lastActivityAt + config.idleMinutes * 60_000,
+    expires: lastActivityAt + config.ttlMinutes * 60_000,
+  }
+  try {
+    const home = await $.env.get('HOME')
+    const id = await $.session.id()
+    const cache = JSON.parse(await $.fs.read(`${home}/.claude/keepwarm/cache/${id}.json`))
+    if (cache.caching_observed && cache.warm && Number.isFinite(cache.expires_at) && cache.expires_at > 0) {
+      const expires = cache.expires_at * 1000
+      return { next: expires - config.cacheMarginMinutes * 60_000, expires }
+    }
+  } catch {
+    // The status line has no cache snapshot before its first update.
+  }
+  return { next: null, expires: null }
+}
+
 // The status line is a separate process, so it reads the keepalive's state from
 // a file named by the session id it gets on stdin. The id is read on every
 // write because a /clear changes it without starting the module again.
@@ -53,12 +73,15 @@ const publish = async ($: any): Promise<void> => {
     const home = await $.env.get('HOME')
     if (!home) return
     const id = await $.session.id()
+    const timing = await schedule($)
     const state = {
       state: stopped ? 'stopped' : paused ? 'paused' : 'active',
       cold: coldUntilNextTurn,
       bumps,
       maxBumps: config.maxBumps,
-      nextBumpAt: Math.ceil((lastActivityAt + config.idleMinutes * 60_000) / 1000),
+      nextBumpAt: timing.next === null ? null : Math.ceil(timing.next / 1000),
+      schedule: config.cacheMarginMinutes > 0 ? 'cache-expiry' : 'idle',
+      cacheMarginMinutes: config.cacheMarginMinutes,
       lastBumpAt: Math.floor(lastBumpAt / 1000),
       reason: stopReason,
       updatedAt: Math.floor((await $.clock.now()) / 1000),
@@ -146,16 +169,23 @@ const tick = async ($: any): Promise<void> => {
   if (stopped || paused || busy || bumping || coldUntilNextTurn) return
 
   const now = await $.clock.now()
-  const idleMinutes = (now - lastActivityAt) / 60_000
-  if (idleMinutes < config.idleMinutes) return
+  const timing = await schedule($)
+  if (timing.next === null || timing.expires === null) {
+    await publish($)
+    return
+  }
 
   // The timer does not run while the machine sleeps, so a bump can come due
   // after the cache already expired. Past the TTL a bump cannot touch anything;
   // it would only rebuild the cache.
-  if (idleMinutes >= config.ttlMinutes) {
+  if (now >= timing.expires) {
     coldUntilNextTurn = true
-    await note($, `idle ${Math.round(idleMinutes)}m, past the ${config.ttlMinutes}m cache TTL; the cache is already cold, not bumping until the next turn rebuilds it`)
+    await note($, 'the cache deadline has passed; waiting for the next turn instead of rebuilding it')
     await publish($)
+    return
+  }
+  if (now < timing.next) {
+    if (config.cacheMarginMinutes > 0) await publish($)
     return
   }
 
@@ -182,7 +212,7 @@ const tick = async ($: any): Promise<void> => {
     return
   }
 
-  await bump($)
+  if (!busy && !paused && !stopped && !bumping && !coldUntilNextTurn) await bump($)
 }
 
 const startTimer = ($: any): void => {
@@ -197,6 +227,7 @@ const start = async ($: any): Promise<void> => {
     maxBumps: number(await $.env.get('KEEPWARM_MAX_BUMPS'), DEFAULTS.maxBumps),
     minContextTokens: number(await $.env.get('KEEPWARM_MIN_CONTEXT_TOKENS'), DEFAULTS.minContextTokens),
     pollSeconds: number(await $.env.get('KEEPWARM_POLL_SEC'), DEFAULTS.pollSeconds),
+    cacheMarginMinutes: number(await $.env.get('KEEPWARM_CACHE_MARGIN_MIN'), DEFAULTS.cacheMarginMinutes),
   }
   lastActivityAt = await $.clock.now()
   startTimer($)
@@ -218,8 +249,11 @@ const status = async ($: any): Promise<string> => {
   if (stopped) return `stopped: ${stopReason}. ${made}.`
   if (paused) return `paused. ${made}. /keepwarm resume turns it back on.`
   if (coldUntilNextTurn) return `waiting for your next turn: the cache is cold, too small to hold, or out of date. ${made}.`
-  const left = Math.max(0, Math.ceil((lastActivityAt + config.idleMinutes * 60_000 - (await $.clock.now())) / 60_000))
-  return `on, next bump in about ${left}m (after ${config.idleMinutes}m idle). ${made}.`
+  const timing = await schedule($)
+  if (timing.next === null) return `waiting for the status line's cache expiry. ${made}.`
+  const left = Math.max(0, Math.ceil((timing.next - (await $.clock.now())) / 60_000))
+  const when = config.cacheMarginMinutes > 0 ? `${config.cacheMarginMinutes}m before cache expiry` : `after ${config.idleMinutes}m idle`
+  return `on, next bump in about ${left}m (${when}). ${made}.`
 }
 
 // Answering without next() runs no model turn, so the command costs nothing and
