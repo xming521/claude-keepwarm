@@ -26,7 +26,7 @@ turn at 8m34s, past the TTL, still read 54,049 and wrote 37.
 
 ## Install
 
-    claude plugin marketplace add Delitefully/claude-keepwarm
+    claude plugin marketplace add xming521/claude-keepwarm
     claude plugin install keepwarm@keepwarm
 
 It needs function hooks. Add this to `~/.claude/settings.json`:
@@ -165,7 +165,14 @@ access, so that API can change between releases.
 
 A bump costs a cache read of the whole conversation every interval. That is a
 good trade if you come back and a bad one if you do not, so keepwarm stops after
-`KEEPWARM_MAX_BUMPS` (default 8, about 8 hours) and lets the cache go cold.
+`KEEPWARM_MAX_BUMPS` (default 8) and lets the cache go cold.
+
+In `keepwarm`, each main-thread turn resets the bump count to zero. Once the
+reply finishes, the idle clock restarts. A new main-thread turn also re-enables
+a keepalive stopped at the bump limit. It preserves a manual pause and does
+not restart a keepalive stopped by the kill switch, API errors or a cache
+rebuild. Subagent activity does not reset the count. `keepwarm-shell` keeps
+its original per-session limit.
 
 Both mechanisms also stop if a bump ever creates more cache than it reads
 (`cache_creation_input_tokens` above `cache_read_input_tokens` on the reply).
@@ -190,8 +197,9 @@ does not inherit the launching shell's environment. See its `config.env.example`
 | | default | |
 |---|---|---|
 | `KEEPWARM_INTERVAL_MIN` | 45 | idle minutes before a bump. Keep it under your TTL, with room for a late tick |
+| `KEEPWARM_PING_TEXT` | built-in single-period prompt | `keepwarm` only: the text sent in the background keepalive request |
 | `KEEPWARM_TTL_MIN` | 60 | your prompt-cache TTL. A bump this late is skipped, since the cache is already cold |
-| `KEEPWARM_MAX_BUMPS` | 8 | bumps before it lets the cache go cold |
+| `KEEPWARM_MAX_BUMPS` | 8 | bumps before it lets the cache go cold; `keepwarm` resets this count on each main-thread turn |
 | `KEEPWARM_MIN_CONTEXT_TOKENS` | 20000 | `keepwarm` only: do not warm a context smaller than this |
 | `KEEPWARM_MIN_TRANSCRIPT_KB` | 150 | `keepwarm-shell` only: the same gate, in transcript bytes |
 | `KEEPWARM_DISABLE` | | `keepwarm-shell` only: `1` turns it off |

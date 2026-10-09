@@ -4,6 +4,7 @@ import type { Register, Timer } from 'claude-code'
 // with this one message after it, so the API serves everything before it from
 // the session's own cache entry. Nothing is appended to the transcript.
 const PING = '[keepwarm] cache keepalive - reply with one period, nothing else.'
+let pingText = PING
 
 const DEFAULTS = {
   idleMinutes: 45,
@@ -21,6 +22,7 @@ let lastActivityAt = 0
 let bumps = 0
 let errors = 0
 let lastBumpAt = 0
+let activityEpoch = 0
 // A main-thread turn is running, so the cache is in use without us.
 let busy = false
 let bumping = false
@@ -32,6 +34,7 @@ let coldUntilNextTurn = false
 // where the idle clock is.
 let paused = false
 let stopped = false
+let restartOnNextTurn = false
 let stopReason = ''
 let timer: Timer | null = null
 
@@ -72,8 +75,9 @@ const note = async ($: any, line: string): Promise<void> => {
   await $.ui.log(line, { to: 'debug' })
 }
 
-const stop = async ($: any, why: string): Promise<void> => {
+const stop = async ($: any, why: string, restartOnTurn = false): Promise<void> => {
   stopped = true
+  restartOnNextTurn = restartOnTurn
   stopReason = why
   timer?.cancel()
   timer = null
@@ -87,11 +91,11 @@ const stop = async ($: any, why: string): Promise<void> => {
 // any tail it writes would live 5m. The subagent TTL variable is read per
 // request, so it is set for this one request and put back after.
 const fork = async ($: any): Promise<any> => {
-  if (config.ttlMinutes < 60) return $.model.fork({ prompt: PING })
+  if (config.ttlMinutes < 60) return $.model.fork({ prompt: pingText })
   const before = await $.env.get('CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL')
   await $.env.set('CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL', '1h')
   try {
-    return await $.model.fork({ prompt: PING })
+    return await $.model.fork({ prompt: pingText })
   } finally {
     await $.env.set('CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL', before)
   }
@@ -99,8 +103,10 @@ const fork = async ($: any): Promise<any> => {
 
 const bump = async ($: any): Promise<void> => {
   bumping = true
+  const epoch = activityEpoch
   try {
     const r = await fork($)
+    if (epoch !== activityEpoch) return
     if (!('usage' in r)) {
       // nothing-to-fork: no main-thread request since a /clear or a resume.
       coldUntilNextTurn = true
@@ -154,7 +160,7 @@ const tick = async ($: any): Promise<void> => {
   }
 
   if (bumps >= config.maxBumps) {
-    await stop($, `reached ${config.maxBumps} bumps; letting the cache go cold`)
+    await stop($, `reached ${config.maxBumps} bumps; letting the cache go cold`, true)
     return
   }
 
@@ -179,7 +185,12 @@ const tick = async ($: any): Promise<void> => {
   await bump($)
 }
 
+const startTimer = ($: any): void => {
+  timer = $.clock.every(config.pollSeconds * 1000, () => void tick($).catch((err: unknown) => note($, `tick failed: ${String(err)}`)))
+}
+
 const start = async ($: any): Promise<void> => {
+  pingText = (await $.env.get('KEEPWARM_PING_TEXT')) ?? PING
   config = {
     idleMinutes: number(await $.env.get('KEEPWARM_INTERVAL_MIN'), DEFAULTS.idleMinutes),
     ttlMinutes: number(await $.env.get('KEEPWARM_TTL_MIN'), DEFAULTS.ttlMinutes),
@@ -188,7 +199,7 @@ const start = async ($: any): Promise<void> => {
     pollSeconds: number(await $.env.get('KEEPWARM_POLL_SEC'), DEFAULTS.pollSeconds),
   }
   lastActivityAt = await $.clock.now()
-  timer = $.clock.every(config.pollSeconds * 1000, () => void tick($).catch((err: unknown) => note($, `tick failed: ${String(err)}`)))
+  startTimer($)
   await publish($)
   // Refused if another plugin already serves /keepwarm; the keepalive still runs.
   try {
@@ -221,13 +232,26 @@ const command = async ($: any, args: string): Promise<{ text: string }> => {
     return { text: 'paused for this session. /keepwarm resume turns it back on.' }
   }
   if (verb === 'resume') {
-    if (stopped) return { text: `stopped (${stopReason}); it does not restart in this session.` }
+    if (stopped) return { text: `stopped (${stopReason}); ${restartOnNextTurn ? 'send a new message to start a fresh keepalive budget.' : 'it does not restart in this session.'}` }
     paused = false
     await publish($)
     return { text: await status($) }
   }
   if (verb === '' || verb === 'status') return { text: await status($) }
   return { text: 'usage: /keepwarm [pause|resume|status]' }
+}
+
+const beginTurn = async ($: any): Promise<void> => {
+  busy = true
+  activityEpoch += 1
+  bumps = 0
+  if (stopped && restartOnNextTurn) {
+    stopped = false
+    restartOnNextTurn = false
+    stopReason = ''
+    startTimer($)
+  }
+  await publish($)
 }
 
 // A real main-thread turn restarts the idle clock and gives the fork a fresh
@@ -245,8 +269,8 @@ export const register: Register = (on) => {
     return next(e)
   })
 
-  on('turn.start', ($, e, next) => {
-    busy = true
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) await beginTurn($)
     return next(e)
   })
 
